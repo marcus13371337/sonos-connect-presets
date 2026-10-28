@@ -1,0 +1,205 @@
+diff --git a/cmd/daemon/cli_config.go b/cmd/daemon/cli_config.go
+index ae7dc94..50b2ed0 100644
+--- a/cmd/daemon/cli_config.go
++++ b/cmd/daemon/cli_config.go
+@@ -65,6 +65,8 @@ type cliConfig struct {
+ 	ZeroconfInterfacesToAdvertise []string `koanf:"zeroconf_interfaces_to_advertise"`
+ 	MprisEnabled                  bool     `koanf:"mpris_enabled"`
+ 	FlacEnabled                   bool     `koanf:"flac_enabled"`
++	SilentPlayback                bool     `koanf:"silent_playback"`
++	DeviceIsGroup                 bool     `koanf:"device_is_group"`
+ 	PreferFirewallFriendlyPorts   bool     `koanf:"prefer_firewall_friendly_ports"`
+ 
+ 	Server struct {
+@@ -140,8 +142,10 @@ func (c *cliConfig) toDaemonConfig() *daemon.Config {
+ 		ZeroconfBackend:               c.ZeroconfBackend,
+ 		ZeroconfInterfacesToAdvertise: c.ZeroconfInterfacesToAdvertise,
+ 
+-		FlacEnabled: c.FlacEnabled,
+-		ImageSize:   c.Server.ImageSize,
++		FlacEnabled:    c.FlacEnabled,
++		SilentPlayback: c.SilentPlayback,
++		DeviceIsGroup:  c.DeviceIsGroup,
++		ImageSize:      c.Server.ImageSize,
+ 
+ 		PreferFirewallFriendlyPorts: c.PreferFirewallFriendlyPorts,
+ 	}
+diff --git a/config_schema.json b/config_schema.json
+index 9e70290..f3057d2 100644
+--- a/config_schema.json
++++ b/config_schema.json
+@@ -342,6 +342,16 @@
+           "description": "Enables MPRIS communication with D-Bus on Linux, and the Now Playing widget and media keys on macOS",
+           "default": false
+         },
++        "device_is_group": {
++          "type": "boolean",
++          "description": "Advertise the device as a group of speakers",
++          "default": false
++        },
++        "silent_playback": {
++          "type": "boolean",
++          "description": "Play silence for each track's duration instead of fetching its audio, for a device that only relays playback state",
++          "default": false
++        },
+         "flac_enabled": {
+           "type": "boolean",
+           "description": "Whether FLAC files should be preferred over other formats when available",
+diff --git a/daemon/app.go b/daemon/app.go
+index 6376f59..5b508cb 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -330,7 +330,8 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err
+ 
+ 		Cache: app.audioCache,
+ 
+-		FlacEnabled: app.cfg.FlacEnabled,
++		FlacEnabled:    app.cfg.FlacEnabled,
++		SilentPlayback: app.cfg.SilentPlayback,
+ 
+ 		NormalisationEnabled:      !app.cfg.NormalisationDisabled,
+ 		NormalisationUseAlbumGain: app.cfg.NormalisationUseAlbumGain,
+diff --git a/daemon/config.go b/daemon/config.go
+index 5a10b3f..ee661c8 100644
+--- a/daemon/config.go
++++ b/daemon/config.go
+@@ -42,7 +42,9 @@ type Config struct {
+ 	ZeroconfBackend               string
+ 	ZeroconfInterfacesToAdvertise []string
+ 
+-	FlacEnabled bool
++	FlacEnabled    bool
++	SilentPlayback bool
++	DeviceIsGroup  bool
+ 
+ 	// PreferFirewallFriendlyPorts tries accesspoints on 443 and 80 before the
+ 	// default 4070, which some networks block outbound.
+diff --git a/daemon/player.go b/daemon/player.go
+index 12e2af9..bec77a7 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -262,6 +262,10 @@ func (p *AppPlayer) handleDealerMessage(msg dealer.Message) error {
+ 			p.state.lastClusterTimestamp = clusterUpdate.Cluster.GetPlayerState().GetTimestamp()
+ 		}
+ 
++		for id, device := range clusterUpdate.Cluster.Device {
++			p.app.log.Debugf("cluster device %q id=%s active=%t", device.Name, id, id == clusterUpdate.Cluster.ActiveDeviceId)
++		}
++
+ 		otherActive := p.state.active && clusterUpdate.Cluster.ActiveDeviceId != p.app.deviceId
+ 		stopBeingActive := otherActive && clusterUpdate.Cluster.PlayerState.Timestamp > p.state.activationTimestamp
+ 
+diff --git a/daemon/player_state.go b/daemon/player_state.go
+index 11787c6..7c09242 100644
+--- a/daemon/player_state.go
++++ b/daemon/player_state.go
+@@ -223,6 +223,7 @@ func (p *AppPlayer) initState() {
+ 			Brand:                 "spotify",
+ 			Model:                 "go-librespot",
+ 			License:               "premium",
++			IsGroup:               p.app.cfg.DeviceIsGroup,
+ 			Capabilities: &connectpb.Capabilities{
+ 				CanBePlayer:                true,
+ 				RestrictToLocal:            false,
+diff --git a/player/player.go b/player/player.go
+index 8d45e52..2c706cc 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -48,6 +48,7 @@ type Player struct {
+ 
+ 	crossfadeSamples          int
+ 	flacEnabled               bool
++	silentPlayback            bool
+ 	normalisationEnabled      bool
+ 	normalisationUseAlbumGain bool
+ 	normalisationPregain      float32
+@@ -123,6 +124,8 @@ type Options struct {
+ 	// When setting this to true, it is assumed that the PlayPlay plugin is provided.
+ 	FlacEnabled bool
+ 
++	SilentPlayback bool
++
+ 	// NormalisationEnabled specifies if the volume should be normalised according
+ 	// to Spotify parameters. Only track normalization is supported.
+ 	NormalisationEnabled bool
+@@ -210,6 +213,7 @@ func NewPlayer(opts *Options) (*Player, error) {
+ 		cache:                     opts.Cache,
+ 		cdnQuarantine:             make(map[string]time.Time),
+ 		flacEnabled:               opts.FlacEnabled,
++		silentPlayback:            opts.SilentPlayback,
+ 		normalisationEnabled:      opts.NormalisationEnabled,
+ 		normalisationUseAlbumGain: opts.NormalisationUseAlbumGain,
+ 		normalisationPregain:      opts.NormalisationPregain,
+@@ -844,6 +848,22 @@ func (p *Player) NewStream(ctx context.Context, client *http.Client, spotId libr
+ 
+ 	log.Debugf("selected format %s (%x)", file.Format.String(), file.FileId)
+ 
++	if p.silentPlayback {
++		silence := newSilentSource(int64(media.Duration()))
++		if position := StartPosition(mediaPosition, int64(media.Duration())); position > 0 {
++			_ = silence.SetPositionMs(position)
++		}
++
++		return &Stream{
++			PlaybackId:  playbackId,
++			RequestedId: requestedId,
++			Source:      silence,
++			Media:       media,
++			File:        file,
++			SampleRate:  SampleRate,
++		}, nil
++	}
++
+ 	audioKey, err := p.retrieveAudioKey(ctx, spotId, file.FileId)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed retrieving audio key: %w", err)
+diff --git a/player/silence.go b/player/silence.go
+new file mode 100644
+index 0000000..0f3b9f8
+--- /dev/null
++++ b/player/silence.go
+@@ -0,0 +1,44 @@
++package player
++
++import (
++	"io"
++	"time"
++)
++
++type silentSource struct {
++	totalFrames    int64
++	positionFrames int64
++	nextReadAt     time.Time
++}
++
++func newSilentSource(durationMs int64) *silentSource {
++	return &silentSource{totalFrames: durationMs * SampleRate / 1000}
++}
++
++func (s *silentSource) SetPositionMs(ms int64) error {
++	s.positionFrames = min(max(ms, 0)*SampleRate/1000, s.totalFrames)
++	return nil
++}
++
++func (s *silentSource) PositionMs() int64 {
++	return s.positionFrames * 1000 / SampleRate
++}
++
++func (s *silentSource) Read(buf []float32) (int, error) {
++	remainingFrames := s.totalFrames - s.positionFrames
++	if remainingFrames <= 0 {
++		return 0, io.EOF
++	}
++
++	if now := time.Now(); s.nextReadAt.Before(now) {
++		s.nextReadAt = now
++	}
++	time.Sleep(time.Until(s.nextReadAt))
++
++	frames := min(int64(len(buf)/Channels), remainingFrames)
++	n := int(frames) * Channels
++	clear(buf[:n])
++	s.positionFrames += frames
++	s.nextReadAt = s.nextReadAt.Add(time.Duration(frames) * time.Second / SampleRate)
++	return n, nil
++}
