@@ -26,3 +26,11 @@ deploy/install_presets.sh
 ```
 
 Copy `presets.example.conf` to `presets.conf` and list your presets first. Each line is `preset <id> "<name>" <true|false: group icon> <coordinator ip> [member ips...]`. API ports are assigned from 3681 in file order, so keep the order stable.
+
+## Disclaimer
+
+Not affiliated with Spotify or Sonos. go-librespot is an unofficial Spotify client, and the bridge calls Spotify's private connect-state API. Both need Spotify Premium and may break or go against Spotify's terms at any time. Use at your own risk.
+
+## License
+
+[GPL-3.0](LICENSE), the same license as go-librespot, which the patch is derived from.
