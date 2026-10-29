@@ -2,21 +2,26 @@ import asyncio
 import hashlib
 import json
 import logging
-import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import websockets
 
-LIBRESPOT_PORT = int(sys.argv[1])
-COORDINATOR_IP = sys.argv[2]
-MEMBER_IPS = sys.argv[3:]
+from sonos import Household, Locator, sonos_api
+
+PRESET = json.loads(Path(sys.argv[1]).read_text())
+LIBRESPOT_PORT = PRESET["port"]
+COORDINATOR = PRESET["coordinator"]
+MEMBERS = PRESET["members"]
 LIBRESPOT_API = f"http://127.0.0.1:{LIBRESPOT_PORT}"
 MAX_VOLUME = 20
-SONOS_API_KEY = "123e4567-e89b-12d3-a456-426655440000"
-SONOS_TLS = ssl._create_unverified_context()
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+LIBRESPOT_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
+TRANSFER_ATTEMPTS_AFTER_LOGIN = 10
 
 log = logging.getLogger("controller")
 
@@ -33,6 +38,12 @@ def http_json(url: str, method: str = "GET", body: dict | None = None, headers: 
     return json.loads(raw) if raw else {}
 
 
+def http_form(url: str, form: dict) -> dict:
+    req = urllib.request.Request(url, method="POST", data=urllib.parse.urlencode(form).encode())
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
 def spclient_host() -> str:
     return http_json("https://apresolve.spotify.com/?type=spclient")["spclient"][0].split(":")[0]
 
@@ -45,78 +56,138 @@ def transfer_playback(to_device_id: str):
               headers={"Authorization": f"Bearer {token}"})
 
 
-def sonos_api(ip: str, path: str, body: dict | None = None) -> dict:
-    req = urllib.request.Request(
-        f"https://{ip}:1443/api/v1{path}",
-        method="POST" if body is not None else "GET",
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={"X-Sonos-Api-Key": SONOS_API_KEY, "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=5, context=SONOS_TLS) as resp:
-        return json.loads(resp.read())
+def log_in_sonos(ip: str):
+    zeroconf = f"http://{ip}:1400/spotifyzc"
+    info = http_json(f"{zeroconf}?action=getInfo")
+    status = http_json(f"{LIBRESPOT_API}/status")
+    token = http_json(f"{LIBRESPOT_API}/token", method="POST")["token"]
+    code = http_form(SPOTIFY_TOKEN_URL, {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": token,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "requested_token_type": "urn:spotify:params:oauth:authorization_code",
+        "resource": "urn:spotify:resources:connect",
+        "client_id": LIBRESPOT_CLIENT_ID,
+        "audience": info["clientID"],
+        "scope": "streaming",
+    })["access_token"]
+    reply = http_form(zeroconf, {
+        "action": "addUser",
+        "userName": status["username"],
+        "blob": code,
+        "clientKey": "",
+        "tokenType": info["tokenType"],
+        "loginId": status["username"],
+        "deviceName": status["device_name"],
+        "deviceId": status["device_id"],
+        "version": info["version"],
+    })
+    if reply["status"] != 101:
+        raise RuntimeError(f"{ip} refused the Spotify login: {reply['statusString']}")
+
+
+def hand_off_to(target_id: str, coordinator_ip: str):
+    try:
+        transfer_playback(target_id)
+        return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    log.info("coordinator is on another Spotify account, logging it in")
+    log_in_sonos(coordinator_ip)
+    for _ in range(TRANSFER_ATTEMPTS_AFTER_LOGIN):
+        time.sleep(1)
+        try:
+            transfer_playback(target_id)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+    raise RuntimeError("coordinator did not show up on the Spotify account after logging in")
 
 
 def sonos_connect_device_id(player_id: str) -> str:
     return hashlib.sha1(player_id.encode()).hexdigest()
 
 
-def regroup(coordinator_ip: str, member_ips: list[str]):
-    info = sonos_api(coordinator_ip, "/players/local/info")
-    household = f"/households/{info['householdId']}"
-    state = sonos_api(coordinator_ip, f"{household}/groups")
-    hosts = {p["id"]: urllib.parse.urlsplit(p["websocketUrl"]).hostname for p in state["players"]}
-    wanted = [info["playerId"]] + [player_id for player_id, host in hosts.items() if host in member_ips]
-    for ip in set(member_ips) - set(hosts.values()):
-        log.warning("%s is offline, skipping", ip)
+def regroup(home: Household, coordinator: str) -> list[dict]:
+    wanted = [coordinator] + [home.room_ids[name] for name in MEMBERS if name in home.room_ids]
+    for name in set(MEMBERS) - home.room_ids.keys():
+        log.warning("%s is offline, skipping", name)
 
     volume = MAX_VOLUME
-    playing = [g for g in state["groups"] if g["playbackState"] == "PLAYBACK_STATE_PLAYING"]
+    playing = [g for g in home.groups if g["playbackState"] == "PLAYBACK_STATE_PLAYING"]
     if playing:
-        group_host = hosts[playing[0]["coordinatorId"]]
+        group_host = home.hosts[playing[0]["coordinatorId"]]
         volume = min(MAX_VOLUME, sonos_api(group_host, f"/groups/{playing[0]['id']}/groupVolume")["volume"])
 
-    current = next(g for g in state["groups"] if info["playerId"] in g["playerIds"])
-    if current["coordinatorId"] == info["playerId"]:
+    coordinator_ip = home.hosts[coordinator]
+    current = next(g for g in home.groups if coordinator in g["playerIds"])
+    if current["coordinatorId"] == coordinator:
         group = sonos_api(coordinator_ip, f"/groups/{current['id']}/groups/setGroupMembers", {"playerIds": wanted})
     else:
-        group = sonos_api(coordinator_ip, f"{household}/groups/createGroup", {"playerIds": wanted})
+        group = sonos_api(coordinator_ip, f"{home.path}/groups/createGroup", {"playerIds": wanted})
     log.info("group is now %s at volume %d", group["group"]["name"], volume)
 
     for player_id in wanted:
         try:
-            sonos_api(hosts[player_id], f"/players/{player_id}/playerVolume", {"volume": volume})
+            sonos_api(home.hosts[player_id], f"/players/{player_id}/playerVolume", {"volume": volume})
         except OSError as e:
-            log.warning("could not set volume on %s: %s", hosts[player_id], e)
+            log.warning("could not set volume on %s: %s", home.hosts[player_id], e)
+    return home.groups
+
+
+def restore_groups(locator: Locator, coordinator: str, previous_groups: list[dict]):
+    for previous in sorted(previous_groups, key=lambda g: g["coordinatorId"] != coordinator):
+        home = locator.household()
+        current = next((g for g in home.groups if previous["coordinatorId"] in g["playerIds"]), None)
+        if (current and current["coordinatorId"] == previous["coordinatorId"]
+                and set(current["playerIds"]) != set(previous["playerIds"])):
+            sonos_api(home.hosts[current["coordinatorId"]], f"/groups/{current['id']}/groups/setGroupMembers",
+                      {"playerIds": previous["playerIds"]})
+    log.info("restored the previous groups")
 
 
 class Handoff:
     def __init__(self):
-        self.target_id: str | None = None
-        self.handed_off = False
+        self.locator = Locator()
+        self.armed = False
 
     def handle(self, event: str, data: dict):
         if event == "active":
-            self.handed_off = False
-        elif event == "playing" and not self.handed_off:
-            self.handed_off = True
-            t0 = time.monotonic()
+            self.armed = True
+        elif event in ("playing", "paused") and self.armed:
+            self.armed = False
+            self.hand_off(data)
+
+    def hand_off(self, data: dict):
+        t0 = time.monotonic()
+        try:
+            home = self.locator.household()
+            coordinator = home.room_ids.get(COORDINATOR)
+            if coordinator is None:
+                raise RuntimeError(f"{COORDINATOR} is offline")
+            previous_groups = None
             try:
-                regroup(COORDINATOR_IP, MEMBER_IPS)
+                previous_groups = regroup(home, coordinator)
             except OSError as e:
                 log.warning("regrouping failed, transferring anyway: %s", e)
             t_grouped = time.monotonic()
-            if self.target_id is None:
-                player_id = sonos_api(COORDINATOR_IP, "/players/local/info")["playerId"]
-                self.target_id = sonos_connect_device_id(player_id)
-            transfer_playback(self.target_id)
+            try:
+                hand_off_to(sonos_connect_device_id(coordinator), home.hosts[coordinator])
+            except Exception:
+                if previous_groups is not None:
+                    restore_groups(self.locator, coordinator, previous_groups)
+                raise
+        finally:
             http_json(f"{LIBRESPOT_API}/player/stop", method="POST")
-            log.info("regrouped in %.2fs, transferred %s in %.2fs", t_grouped - t0, data.get("uri"),
-                     time.monotonic() - t_grouped)
+        log.info("regrouped in %.2fs, transferred %s in %.2fs", t_grouped - t0, data.get("uri"),
+                 time.monotonic() - t_grouped)
 
 
 async def main():
     handoff = Handoff()
-    log.info("handing off to %s (+%s)", COORDINATOR_IP, ", ".join(MEMBER_IPS) or "no members")
+    log.info("handing off to %s (+%s)", COORDINATOR, ", ".join(MEMBERS) or "no members")
     async for ws in websockets.connect(f"ws://127.0.0.1:{LIBRESPOT_PORT}/events"):
         try:
             async for raw in ws:

@@ -7,39 +7,9 @@ CONFIG=${1:-$REPO/presets.conf}
 mkdir -p /opt/spotify-bridge
 [ -d /opt/spotify-bridge/venv ] || python3 -m venv /opt/spotify-bridge/venv
 /opt/spotify-bridge/venv/bin/pip install -q -r "$REPO/bridge/requirements.txt"
-install -m 644 "$REPO/bridge/controller.py" /opt/spotify-bridge/controller.py
+install -m 644 "$REPO/bridge/controller.py" "$REPO/bridge/sonos.py" /opt/spotify-bridge/
 
-PRESETS=""
-NEXT_PORT=3681
-
-preset() {
-  local id=$1 name=$2 is_group=$3 coordinator=$4 port=$NEXT_PORT; shift 4
-  PRESETS="$PRESETS $id"
-  NEXT_PORT=$((NEXT_PORT + 1))
-  mkdir -p "/etc/go-librespot/$id"
-  cat > "/etc/go-librespot/$id/config.yml" <<EOF
-device_name: $name
-device_type: speaker
-device_is_group: $is_group
-audio_backend: pipe
-audio_output_pipe: /run/go-librespot-$id/audio.fifo
-silent_playback: true
-bitrate: 96
-zeroconf_enabled: true
-credentials:
-  type: zeroconf
-  zeroconf:
-    persist_credentials: true
-server:
-  enabled: true
-  address: 127.0.0.1
-  port: $port
-log_level: debug
-EOF
-  printf 'PORT=%s\nCOORDINATOR=%s\nMEMBERS="%s"\n' "$port" "$coordinator" "$*" > "/etc/go-librespot/$id/bridge.conf"
-}
-
-source "$CONFIG"
+PRESETS=$(PYTHONPATH="$REPO/bridge" python3 "$REPO/deploy/presets.py" "$CONFIG")
 
 cat > /etc/systemd/system/go-librespot@.service <<'EOF'
 [Unit]
@@ -65,8 +35,7 @@ After=go-librespot@%i.service
 Requires=go-librespot@%i.service
 
 [Service]
-EnvironmentFile=/etc/go-librespot/%i/bridge.conf
-ExecStart=/opt/spotify-bridge/venv/bin/python -u /opt/spotify-bridge/controller.py $PORT $COORDINATOR $MEMBERS
+ExecStart=/opt/spotify-bridge/venv/bin/python -u /opt/spotify-bridge/controller.py /etc/go-librespot/%i/bridge.json
 Restart=always
 RestartSec=2
 
