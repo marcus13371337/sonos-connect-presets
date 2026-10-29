@@ -10,7 +10,7 @@ Pick "🔊 Alla" in Spotify and the bridge groups the Sonos speakers, sets every
   - `silent_playback`: plays real-time paced silence for each track instead of fetching audio. No audio keys, no decoding.
   - `device_is_group`: shows the device with Spotify's group icon.
 - `bridge/controller.py` runs one per preset. It listens on go-librespot's event websocket. On the first `playing` or `paused` event after the device becomes active it:
-  1. Finds a Sonos speaker through SSDP, looks up the preset's rooms by name, and regroups them through the Sonos local API (`https://<ip>:1443/api/v1`).
+  1. Finds a Sonos speaker through SSDP, looks up the preset's speakers by name, and regroups them through the Sonos local API (`https://<ip>:1443/api/v1`).
   2. Transfers playback through Spotify's connect-state API to the coordinator. The coordinator's Spotify Connect ID is `sha1(RINCON id)`.
   3. Stops the virtual device.
 - A Sonos speaker is logged in to one Spotify account at a time, and only that account can transfer playback to it. When the transfer fails because the coordinator is on another account, the bridge logs the coordinator in to the preset's account through Sonos's local zeroconf endpoint (`http://<ip>:1400/spotifyzc`) and retries. The login sends an authorization code from Spotify's token exchange, issued for Sonos's client ID.
@@ -25,14 +25,14 @@ deploy/build_librespot.sh
 deploy/install_presets.sh
 ```
 
-The install script finds every Sonos room and creates one preset per room plus "🔊 Alla" with all rooms. Presets that no longer exist are removed. Run it again after adding or renaming a room in Sonos.
+Speakers are referred to by their name in the Sonos app. A stereo pair or home theater setup counts as one speaker. The install script finds every speaker and creates one preset per speaker plus "🔊 Alla" with all speakers. Presets that no longer exist are removed. Run it again after adding or renaming a speaker in Sonos.
 
 `presets.conf` is optional. See `presets.example.conf`:
 
-- `prefix room "<prefix>"`, `prefix group "<prefix>"`: put before the names shown in Spotify. Defaults are `🔈 ` and `🔊 `.
-- `all "<name>" [coordinator "<room>"]`: renames Alla or picks its coordinator, which streams for the whole group. Defaults to the first room alphabetically. `all off` removes it.
-- `exclude "<room>"...`: leaves rooms out of every automatic preset.
-- `group <id> "<name>" "<coordinator room>" "<room>"...`: adds a preset for its own group.
+- `prefix speaker "<prefix>"`, `prefix group "<prefix>"`: put before the names shown in Spotify. Defaults are `🔈 ` and `🔊 `.
+- `all "<name>" [coordinator "<speaker>"]`: renames Alla or picks its coordinator, which streams for the whole group. Defaults to the first speaker alphabetically. `all off` removes it.
+- `exclude "<speaker>"...`: leaves speakers out of every automatic preset.
+- `group <id> "<name>" "<coordinator speaker>" "<speaker>"...`: adds a preset for its own group.
 
 `PYTHONPATH=bridge python3 deploy/presets.py presets.conf --dry-run` shows the presets without installing.
 

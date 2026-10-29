@@ -43,7 +43,7 @@ class Preset:
 
 @dataclass
 class Config:
-    room_prefix: str = "🔈 "
+    speaker_prefix: str = "🔈 "
     group_prefix: str = "🔊 "
     all_name: str | None = "Alla"
     all_coordinator: str | None = None
@@ -64,18 +64,18 @@ def parse(path: Path) -> Config:
         match shlex.split(line, comments=True):
             case []:
                 pass
-            case ["prefix", "room", prefix]:
-                config.room_prefix = prefix
+            case ["prefix", "speaker", prefix]:
+                config.speaker_prefix = prefix
             case ["prefix", "group", prefix]:
                 config.group_prefix = prefix
             case ["all", "off"]:
                 config.all_name = None
             case ["all", name]:
                 config.all_name = name
-            case ["all", name, "coordinator", room]:
-                config.all_name, config.all_coordinator = name, room
-            case ["exclude", *rooms]:
-                config.excluded.update(rooms)
+            case ["all", name, "coordinator", speaker]:
+                config.all_name, config.all_coordinator = name, speaker
+            case ["exclude", *speakers]:
+                config.excluded.update(speakers)
             case ["group", preset_id, name, coordinator, *members]:
                 config.groups.append(Preset(preset_id, name, coordinator, members))
             case _:
@@ -83,28 +83,28 @@ def parse(path: Path) -> Config:
     return config
 
 
-def plan(config: Config, rooms: list[str]) -> list[Preset]:
-    rooms = sorted(set(rooms) - config.excluded)
+def plan(config: Config, speakers: list[str]) -> list[Preset]:
+    speakers = sorted(set(speakers) - config.excluded)
     presets = []
-    if config.all_name is not None and len(rooms) > 1:
-        coordinator = config.all_coordinator or rooms[0]
+    if config.all_name is not None and len(speakers) > 1:
+        coordinator = config.all_coordinator or speakers[0]
         presets.append(Preset(slug(config.all_name), config.all_name, coordinator,
-                              [room for room in rooms if room != coordinator]))
+                              [speaker for speaker in speakers if speaker != coordinator]))
     presets += config.groups
-    presets += [Preset(slug(room), room, room) for room in rooms]
+    presets += [Preset(slug(speaker), speaker, speaker) for speaker in speakers]
 
     ids = [preset.id for preset in presets]
     if duplicates := {i for i in ids if ids.count(i) > 1}:
         sys.exit(f"duplicate preset ids: {', '.join(sorted(duplicates))}")
     for preset in presets:
-        for room in {preset.coordinator, *preset.members} - set(rooms):
-            print(f"warning: {preset.id} uses {room}, which is not among the found rooms", file=sys.stderr)
+        for speaker in {preset.coordinator, *preset.members} - set(speakers):
+            print(f"warning: {preset.id} uses {speaker}, which is not among the found speakers", file=sys.stderr)
     return presets
 
 
 def write(config: Config, presets: list[Preset]):
     for port, preset in enumerate(presets, FIRST_PORT):
-        prefix = config.group_prefix if preset.members else config.room_prefix
+        prefix = config.group_prefix if preset.members else config.speaker_prefix
         directory = CONFIG_ROOT / preset.id
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "config.yml").write_text(LIBRESPOT_CONFIG.format(
@@ -131,7 +131,7 @@ def remove_stale(presets: list[Preset]):
 def main():
     dry_run = "--dry-run" in sys.argv
     config = parse(Path(next(arg for arg in sys.argv[1:] if arg != "--dry-run")))
-    presets = plan(config, list(household(discover_player_ip()).room_ids))
+    presets = plan(config, list(household(discover_player_ip()).speaker_ids))
     if dry_run:
         for preset in presets:
             print(f"{preset.id} \"{preset.name}\": {preset.coordinator} + {', '.join(preset.members) or '-'}", file=sys.stderr)

@@ -111,8 +111,8 @@ def sonos_connect_device_id(player_id: str) -> str:
 
 
 def regroup(home: Household, coordinator: str) -> list[dict]:
-    wanted = [coordinator] + [home.room_ids[name] for name in MEMBERS if name in home.room_ids]
-    for name in set(MEMBERS) - home.room_ids.keys():
+    wanted = [coordinator] + [home.speaker_ids[name] for name in MEMBERS if name in home.speaker_ids]
+    for name in set(MEMBERS) - home.speaker_ids.keys():
         log.warning("%s is offline, skipping", name)
 
     volume = MAX_VOLUME
@@ -164,7 +164,7 @@ class Handoff:
         t0 = time.monotonic()
         try:
             home = self.locator.household()
-            coordinator = home.room_ids.get(COORDINATOR)
+            coordinator = home.speaker_ids.get(COORDINATOR)
             if coordinator is None:
                 raise RuntimeError(f"{COORDINATOR} is offline")
             previous_groups = None

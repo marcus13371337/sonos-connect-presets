@@ -47,7 +47,7 @@ class Household:
     path: str
     groups: list[dict]
     hosts: dict[str, str]
-    room_ids: dict[str, str]
+    speaker_ids: dict[str, str]
 
 
 def household(ip: str) -> Household:
@@ -58,7 +58,7 @@ def household(ip: str) -> Household:
         path=path,
         groups=state["groups"],
         hosts={p["id"]: urllib.parse.urlsplit(p["websocketUrl"]).hostname for p in state["players"]},
-        room_ids={p["name"]: p["id"] for p in state["players"]},
+        speaker_ids={p["name"]: p["id"] for p in state["players"]},
     )
 
 
